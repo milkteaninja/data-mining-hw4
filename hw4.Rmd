@@ -1,0 +1,409 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## 1.Data importation and manipulation
+
+First, we read in all datasets given, both traning and testing.
+```{r}
+#read in data
+library(tidyverse)
+library(readr)
+
+location <- read_csv("C:/Users/zhang/Desktop/6240_r/hw4/Location.csv")
+#pair comparison see if duplicate
+itemPairsTest <- read_csv("C:/Users/zhang/Desktop/6240_r/hw4/ItemPairs_test.csv")
+itemPairsTrain <- read_csv("C:/Users/zhang/Desktop/6240_r/hw4/ItemPairs_train.csv")
+#info
+itemInfoTest <- read_csv("C:/Users/zhang/Desktop/6240_r/hw4/ItemInfo_test.csv")
+itemInfoTrain <- read_csv("C:/Users/zhang/Desktop/6240_r/hw4/ItemInfo_train.csv")
+```
+
+Log of price is not necessarily useful for the model. 
+```{r}
+#trail:when id is either id1 or id2, present the data
+#id1 <- itemPairsTrain[6,1]
+#id2 <- itemPairsTrain[6,2]
+#itemInfoTrain %>% filter(itemID %in% c(id1,id2))
+
+#change price into log form and get the density plot for log price to see if the distribution is normal. 
+#itemInfoTrain %>% 
+#  mutate(logprice=log(price)) %>% 
+#  ggplot + geom_density(aes(x=logprice))
+```
+
+After reading in the data, we want to combine the two traning datasets itemPairsTrain and itemInfoTrain according to the item-ids these ads are assigned to. Also, we merge the location data into this dataset as well. So we will have all the information for the two products in the same row. 
+```{r}
+#Join training data#
+
+#maerge location to the item info training and testing datasets
+str(itemInfoTrain)
+itemInfoTrain <- itemInfoTrain %>% 
+  left_join(location)
+
+itemInfoTest <- itemInfoTest %>% 
+  left_join(location)
+
+itemInfoTrain %>% group_by(regionID) %>% 
+  summarise(mean_lat=mean(lat),
+            mean_lon=mean(lon),
+            size = n()
+  ) %>% 
+  ggplot(aes(y=mean_lat,x=mean_lon,size=size))+
+  geom_point()
+
+
+##Join training data##
+
+train <- itemPairsTrain %>% left_join(itemInfoTrain,
+                                       by = c("itemID_1" = "itemID"))
+colnames(train)[5:15] <- paste0(colnames(train)[5:15],"_1")
+
+train <- train %>% left_join(itemInfoTrain,
+                             by = c("itemID_2" = "itemID"))
+colnames(train)[16:26] <- paste0(colnames(train)[16:26],"_2")
+
+
+##Join testing data##
+
+test <- itemPairsTest %>% left_join(itemInfoTest,
+                                     by = c("itemID_1" = "itemID"))
+colnames(test)[4:14] <- paste0(colnames(test)[4:14],"_1")
+
+test <- test %>% left_join(itemInfoTest,
+                           by = c("itemID_2" = "itemID"))
+colnames(test)[15:25] <- paste0(colnames(test)[15:25],"_2")
+```
+
+The metro location data has too much missing data (nearly 60% of the data is missing) thus it cannot be a good predictor for the model. 
+```{r}
+#see how much missing data are there
+metroID_1.total <- length(train$metroID_1)
+metroID_2.total <- length(train$metroID_2)
+metroID_1.missing <- sum(is.na(train$metroID_1))
+metroID_2.missing <- sum(is.na(train$metroID_2))
+
+metroID_1.missing/metroID_1.total#metroID_1.missing.percentage
+metroID_2.missing/metroID_2.total##metroID_2.missing.percentage
+```
+
+Since the training dataset is too large for us to run, we randomly chose 10% of the dataset to build the model.
+```{r}
+set.seed(1)
+train_val_id <- sample(nrow(train),
+                       size = floor(nrow(train)*.10),replace = FALSE)
+train_val <- train[train_val_id,]
+train <- train[-train_val_id,]
+```
+
+Since similar product should have similar prices, the price different between item1 and item2 should be critical for identification of duplicity. Therefore, add a new variable to both training and testing datasets. The variable should equal to 1 if the result of the subtraction is small 0 for otherwise. For regionID, categoryID, and title, create new categorical variable. If two items have the same value for these variables, the result is 1, 0 otherwise. 
+```{r}
+#make adjustement to the datasets
+quasi_creator_1 <- function(x){
+  x %>% mutate(
+         distance = sqrt((lat_1-lat_2)^2+(lon_1-lon_2)^2),
+         price_min=pmin(log(price_1),log(price_2)),
+         price_max=pmax(log(price_1),log(price_2)),
+         price.diff=abs(price_1-price_2),
+         price.diffpct=1*(abs(price_1-price_2)/pmin(price_1,price_2)<0.20), #if the difference in price is higher than 15% of the cheaper item, the price is assumed to be significantly different
+         description_same=1*(description_1==description_2),
+         location_same=1*(locationID_1==locationID_2),
+         region_same=1*(regionID_1==regionID_2),
+         category_same=1*(categoryID_1==categoryID_2),
+         title_same=1*(title_1==title_2))
+}
+
+#change to the datasets using the function created above
+train <- train %>% quasi_creator_1
+train_val <- train_val%>% quasi_creator_1
+test <- test %>% quasi_creator_1
+
+```
+
+Looking at the new variables created, see how much of the data is NA. Since in all cases the percentages of missing data are not high, we can still use these variables. In addition, we can use mean imputation for these missing data. 
+```{r}
+#see the percentages of data missing
+sum(is.na(train$price.diffpct))/length(train$price.diffpct) #0.1133116
+sum(is.na(train$region_same))/length(train$region_same) #0
+sum(is.na(train$title_same))/length(train$title_same)#3.714356e-07
+sum(is.na(train$description_same))/length(train$description_same)#.528638e-05
+sum(is.na(train$location_same))/length(train$location_same)#0
+
+#use imputation to fill up the missing spots for train
+train$price_min <- ifelse(is.na(train$price_min), mean(train$price_min, na.rm=TRUE), train$price_min)
+
+train$price_max <- ifelse(is.na(train$price_max), mean(train$price_max, na.rm=TRUE), train$price_max)
+
+train$distance <- ifelse(is.na(train$distance), mean(train$distance, na.rm=TRUE), train$distance)
+
+train$price.diffpct <- ifelse(is.na(train$price.diffpct), mean(train$price.diffpct, na.rm=TRUE), train$price.diffpct)
+
+train$region_same <- ifelse(is.na(train$region_same), mean(train$region_same, na.rm=TRUE), train$region_same)
+
+train$title_same <- ifelse(is.na(train$title_same), mean(train$title_same, na.rm=TRUE), train$title_same)
+
+train$description_same <- ifelse(is.na(train$description_same), mean(train$description_same, na.rm=TRUE), train$description_same)
+
+train$location_same <- ifelse(is.na(train$location_same), mean(train$location_same, na.rm=TRUE), train$location_same)
+
+train$price_max <- ifelse(is.na(train$price_max), mean(train$price_max, na.rm=TRUE), train$price_max)
+
+train$price_min <- ifelse(is.na(train$price_min), mean(train$price_min, na.rm=TRUE), train$price_min)
+
+
+#train_val
+train_val$price_min <- ifelse(is.na(train_val$price_min), mean(train_val$price_min, na.rm=TRUE), train_val$price_min)
+
+train_val$price_max <- ifelse(is.na(train_val$price_max), mean(train_val$price_max, na.rm=TRUE), train_val$price_max)
+
+train_val$distance <- ifelse(is.na(train_val$distance), mean(train_val$distance, na.rm=TRUE), train_val$distance)
+
+train_val$price.diffpct <- ifelse(is.na(train_val$price.diffpct), mean(train_val$price.diffpct, na.rm=TRUE), train_val$price.diffpct)
+
+train_val$region_same <- ifelse(is.na(train_val$region_same), mean(train_val$region_same, na.rm=TRUE), train_val$region_same)
+
+train_val$title_same <- ifelse(is.na(train_val$title_same), mean(train_val$title_same, na.rm=TRUE), train_val$title_same)
+
+train_val$description_same <- ifelse(is.na(train_val$description_same), mean(train_val$description_same, na.rm=TRUE), train_val$description_same)
+
+train_val$location_same <- ifelse(is.na(train_val$location_same), mean(train_val$location_same, na.rm=TRUE), train_val$location_same)
+
+train_val$price_max <- ifelse(is.na(train_val$price_max), mean(train_val$price_max, na.rm=TRUE), train_val$price_max)
+
+train_val$price_min <- ifelse(is.na(train_val$price_min), mean(train_val$price_min, na.rm=TRUE), train_val$price_min)
+
+#test
+test$price_min <- ifelse(is.na(test$price_min), mean(test$price_min, na.rm=TRUE), test$price_min)
+
+test$price_max <- ifelse(is.na(test$price_max), mean(test$price_max, na.rm=TRUE), test$price_max)
+
+test$distance <- ifelse(is.na(test$distance), mean(test$distance, na.rm=TRUE), test$distance)
+
+test$price.diffpct <- ifelse(is.na(test$price.diffpct), mean(test$price.diffpct, na.rm=TRUE), test$price.diffpct)
+
+test$region_same <- ifelse(is.na(test$region_same), mean(test$region_same, na.rm=TRUE), test$region_same)
+
+test$title_same <- ifelse(is.na(test$title_same), mean(test$title_same, na.rm=TRUE), test$title_same)
+
+test$description_same <- ifelse(is.na(test$description_same), mean(test$description_same, na.rm=TRUE), test$description_same)
+
+test$location_same <- ifelse(is.na(test$location_same), mean(test$location_same, na.rm=TRUE), test$location_same)
+
+test$price_max <- ifelse(is.na(test$price_max), mean(test$price_max, na.rm=TRUE), test$price_max)
+
+test$price_min <- ifelse(is.na(test$price_min), mean(test$price_min, na.rm=TRUE), test$price_min)
+
+```
+
+## 2. Models
+Try out different classifiers and choose the one with highest AUC. Improve the model by variable transformation. Finally, choose the model with the hightest AUC score. Here, LDA, QDA, Logistic regression, SVM, Decision Trees, Random Forests, various forms of Boosting are used.
+
+
+By looking at the results of this model, the AUC score is 0.6411356 Since a random guess would generate an AUC of 0.5, the AUC score here is not amazing for LDA.
+```{r}
+#Linear discriminent analysis#
+#fit the LDA model based on train
+# Classification: ROC Curve and AUC: https://developers.google.com/machine-learning/crash-course/classification/roc-and-auc
+library(MASS)
+lda.fit<-lda(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=train) 
+
+
+lda.fit
+
+lda.class <- predict(lda.fit)$class #give prediction
+table(train$isDuplicate,lda.class) #compare with the real value using confusion matrix
+
+#AUC
+library(ROCR)
+#get the prediction value
+lda.predictions <-predict(lda.fit,train_val)$class
+#turn the prediction values into data frame
+lda.pred <- as.data.frame(sapply(lda.predictions, as.numeric)) 
+#isDuplicate of train_val
+real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+#create prediction and real set
+lda.pred <- prediction(lda.pred,labels=real)#label means the true value,test_val is the other 90% of the training data
+
+#calculate AUC value
+performance(lda.pred,"auc")@y.values[[1]] #AUC value for train_val
+
+#ROC (receiver operating characteristic curve) plot
+
+#performance(lda.pred,"tpr","fpr") #ROC
+#plot(lda.ROC)#ROC
+#A perfect predictor gives an AUC-ROC score of 1, a predictor which makes random guesses has an AUC-ROC score of 0.5.
+```
+
+QDA generates AUC score of 0.6363608 which is even worse than LDA.
+```{r}
+#Quadratic discriminent analysis#
+qda.fit <- qda(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=train)
+
+qda.fit
+
+qda.predictions <-predict(qda.fit,train_val)$class
+
+qda.pred <- as.data.frame(sapply(qda.predictions, as.numeric)) 
+
+real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+
+qda.pred <- prediction(qda.pred,labels=real)
+
+performance(qda.pred,"auc")@y.values[[1]] #AUC
+
+#performance(qda.pred,"tpr","fpr") #ROC
+```
+
+The AUC score for logistic regression is 0.7455485 which is higher than those of QDA and LDA.
+```{r}
+#Logistic regression#
+log.fit <- glm(isDuplicate ~price_min+price_max+distance+ location_same+description_same+region_same+category_same+title_same+price.diffpct,data=train,family="binomial")
+
+log.fit %>% summary
+
+
+log.predictions<-predict(log.fit, newdata = train_val,type = "response")#Obtains predictions from a fitted generalized linear model. 
+
+log.pred <- as.data.frame(sapply(log.predictions, as.numeric)) 
+
+real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+
+log.predict <- prediction(log.pred,labels=real)
+
+performance(log.predict,"auc")@y.values[[1]]
+```
+
+I am not able to predict because the prediction by the "predict" function produce missing output. Mnay of the predictions are not generated. They are not NA, intead they are just missing. In other words, the number of predictions is not equal to the number if isDuplicate in the train_val. Thus, AUC score cannot be checked.  
+```{r}
+#install.packages("e1071")
+#library(e1071)
+#Support Vector Machine#
+#train1 <- sample_frac(train,0.001)
+#train1 <- data.frame(train1)
+#train1$isDuplicate=as.factor(train1$isDuplicate)
+#svm linear fit
+#svm.fit1 <- svm(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=train1,scale = TRUE,        method="C-classifcation",cost=10,kernel="linear")
+
+#svm.fit1.pred <- svm.fit1 %>% 
+ # predict(train_val) %>% 
+ # prediction(labels=train_val$isDuplicate)
+
+#performance(svm.fit1.pred,"auc")@y.values[[1]]
+```
+
+Decision Tree without bagging gives AUC score of 0.6134513 which is close to the reults of QDA and LDA.
+```{r}
+#Decision Trees#
+library (tree)
+library (ISLR)
+
+train.tree <- data.frame(train)
+train.tree$isDuplicate <- as.factor(train.tree$isDuplicate)
+
+tree.fit= tree( isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=train.tree )
+
+summary(tree.fit)
+
+plot(tree.fit);text(tree.fit ,pretty =0)
+
+tree.prediction<-predict(tree.fit,train_val)
+
+
+modify <- function(x){
+  x %>% mutate(
+        prediction = 1*(tree.prediction[,1]<tree.prediction[,2]))
+}
+
+tree.prediction<- data.frame(tree.prediction)
+tree.prediction<- tree.prediction %>% modify
+
+tree.pred <- prediction(tree.prediction$prediction,labels=train_val$isDuplicate)
+performance(tree.pred,"auc")@y.values[[1]]
+
+```
+
+The AUC score for Random Forest is 0.6610911
+```{r}
+#Random Forests#
+#install.packages("randomForest")
+library(randomForest)
+
+randomforest.train <- sample_frac(train,0.001)
+randomforest.train$isDuplicate <- as.factor(randomforest.train$isDuplicate)
+randomforest.train<-data.frame(randomforest.train)
+
+randomForest.fit <- randomForest(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=randomforest.train, importance = TRUE, mtry=5,ntree=800)
+
+randomForest.fit
+
+
+randomForest.predictions<-predict(randomForest.fit, newdata = train_val)
+
+randomForest.pred <- as.data.frame(sapply(randomForest.predictions, as.numeric)) 
+
+real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+
+randomForest.predict <- prediction(randomForest.pred,labels=real)
+
+performance(randomForest.predict,"auc")@y.values[[1]]
+```
+
+The AUC score for Gradient Boosting Machines is 0.7253959
+```{r}
+#install.packages("gbm")
+library(gbm)
+train1 <- sample_frac(train,0.001)
+
+gbm.fit <-gbm(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=train1,
+                distribution = "bernoulli",
+                n.trees = 800,
+                interaction.depth = 10)
+
+gbm.predictions<-predict(gbm.fit, n.trees=800, newdata = train_val)
+
+gbm.pred <- as.data.frame(sapply(gbm.predictions, as.numeric)) 
+
+real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+
+gbm.predict <- prediction(gbm.pred,labels=real)
+
+
+performance(gbm.predict,"auc")@y.values[[1]]
+```
+
+The AUC score for adaboost0.658594
+```{r}
+#install.packages('fastAdaboost')
+library(fastAdaboost)
+trainadaboost<-data.frame(train1)
+
+adaboost.fit <- adaboost(isDuplicate~price_min+price_max+distance+location_same+description_same+region_same+title_same+price.diffpct,data=trainadaboost,8)
+
+adaboost.predictions<-predict(adaboost.fit,newdata = train_val)
+
+adaboost.pred <- adaboost.predictions[2]
+adaboost.pred<- as.data.frame(adaboost.pred)
+a<-adaboost.pred[,1]
+b<-adaboost.pred[,2]
+
+#for (i in 1:length(a)){
+#  prediction[i] = 1*(a[i]<b[i])
+#}
+#real <-  as.data.frame(sapply(train_val$isDuplicate, as.numeric)) 
+
+#adaboost.predict <- prediction(prediction,labels=real)
+
+#performance(adaboost.predict,"auc")@y.values[[1]]
+```
+
+
+Therefore, logistic regression generates the highest AUC score which is 0.7455485. Thus, we use logistic regression to predict using the test data.
+```{r}
+log.predictions.test<-predict(log.fit, newdata = test,type = "response")
+#write.csv(log.predictions.test, file = "MyData.csv")
+```
+
+
